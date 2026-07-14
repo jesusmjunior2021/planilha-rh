@@ -397,37 +397,74 @@ def obter_dados():
 
 
 # ==========================================================================
-# ESTILO — verde / branco / azul + tema escuro (azul/branco), contraste OK
+# ESTILO — SEMPRE ESCURO (fixo, sem toggle) · azul/verde de destaque,
+# contraste alto em tudo — sidebar, botões, inputs, textos secundários.
 # ==========================================================================
-def aplicar_estilo(modo_escuro: bool):
-    if modo_escuro:
-        bg, bg_card, texto, azul, verde, borda = (
-            "#0B1220", "#131C2E", "#F5F7FA", "#3B82F6", "#22C55E", "#1E2A44"
-        )
-    else:
-        bg, bg_card, texto, azul, verde, borda = (
-            "#FFFFFF", "#F3F8F4", "#0B1220", "#1D4ED8", "#15803D", "#D6E4DC"
-        )
+BG = "#0B1220"          # fundo principal
+BG_CARD = "#182238"     # cards/sidebar — mais claro que o fundo, não igual
+BG_INPUT = "#1F2A44"    # inputs/botões
+TEXTO = "#F5F7FA"       # texto principal — branco quase puro
+TEXTO_MUDO = "#B7C0D1"  # texto secundário — cinza claro, NUNCA opacity baixa
+AZUL = "#4F8CFF"
+VERDE = "#2ECC71"
+BORDA = "#2B3A5C"
 
+
+def aplicar_estilo():
     st.markdown(f"""
     <style>
-        .stApp {{ background-color: {bg}; color: {texto}; }}
+        .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {{
+            background-color: {BG} !important; color: {TEXTO} !important;
+        }}
+
+        /* Sidebar inteira — fundo, texto, labels de widgets */
+        section[data-testid="stSidebar"] {{
+            background-color: {BG_CARD} !important; border-right: 1px solid {BORDA};
+        }}
+        section[data-testid="stSidebar"] * {{ color: {TEXTO} !important; }}
+        section[data-testid="stSidebar"] label p {{ color: {TEXTO} !important; opacity: 1 !important; }}
+        section[data-testid="stSidebar"] .stCaption, section[data-testid="stSidebar"] small {{
+            color: {TEXTO_MUDO} !important;
+        }}
+
+        /* Botões e uploader */
+        .stButton button, .stDownloadButton button, [data-testid="stFileUploaderDropzone"] {{
+            background-color: {BG_INPUT} !important; color: {TEXTO} !important;
+            border: 1px solid {BORDA} !important;
+        }}
+        .stButton button:hover, .stDownloadButton button:hover {{
+            border-color: {AZUL} !important; color: {AZUL} !important;
+        }}
+
+        /* Inputs, selects, multiselect, text_input */
+        input, textarea, [data-baseweb="select"] > div, [data-baseweb="tag"] {{
+            background-color: {BG_INPUT} !important; color: {TEXTO} !important;
+            border-color: {BORDA} !important;
+        }}
+
+        /* Cards de métrica (KPIs) */
         [data-testid="stMetric"] {{
-            background-color: {bg_card}; border: 1px solid {borda};
+            background-color: {BG_CARD} !important; border: 1px solid {BORDA};
             border-radius: 10px; padding: 12px 14px;
         }}
-        [data-testid="stMetricValue"] {{ color: {azul}; }}
-        [data-testid="stMetricLabel"] {{ color: {texto}; }}
-        h1, h2, h3 {{ color: {azul}; }}
+        [data-testid="stMetricValue"] {{ color: {AZUL} !important; font-weight: 700; }}
+        [data-testid="stMetricLabel"] {{ color: {TEXTO} !important; }}
+
+        /* Títulos e legendas */
+        h1, h2, h3 {{ color: {AZUL} !important; }}
+        .stCaption, [data-testid="stCaptionContainer"], p {{ color: {TEXTO} !important; }}
+        .stMarkdown small {{ color: {TEXTO_MUDO} !important; }}
+
+        /* Mensagens de sucesso/aviso/erro — mantém legível no fundo escuro */
+        [data-testid="stAlert"] {{ background-color: {BG_CARD} !important; }}
+
         .rodape-app {{
-            color: {texto}; opacity: 0.55; font-size: 0.75rem;
-            text-align: right; margin-top: 2rem; border-top: 1px solid {borda};
-            padding-top: 8px;
+            color: {TEXTO_MUDO}; font-size: 0.75rem; text-align: right;
+            margin-top: 2rem; border-top: 1px solid {BORDA}; padding-top: 8px;
         }}
-        section[data-testid="stSidebar"] {{ background-color: {bg_card}; }}
     </style>
     """, unsafe_allow_html=True)
-    return azul, verde
+    return AZUL, VERDE
 
 
 # ==========================================================================
@@ -723,8 +760,7 @@ def main():
     if "autenticado" not in st.session_state:
         st.session_state["autenticado"] = False
 
-    modo_escuro = st.sidebar.toggle("🌙 Tema escuro (azul/branco)", value=False)
-    azul, verde = aplicar_estilo(modo_escuro)
+    azul, verde = aplicar_estilo()
 
     if not st.session_state["autenticado"]:
         tela_login()
