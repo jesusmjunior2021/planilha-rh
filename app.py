@@ -44,6 +44,12 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import streamlit as st
 import altair as alt
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 import streamlit.components.v1 as components
 
 # ==========================================================================
