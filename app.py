@@ -1,47 +1,58 @@
 # -*- coding: utf-8 -*-
 """
-app.py — Painel RH TJMA · Auxílio-Bolsa (GDG)
+main.py — Painel RH TJMA · Auxílio-Bolsa (GDG)
 Adm. Jesus Martins Oliveira Junior — COGEX-MA/TJMA
-MAT-RHBOLSAS-STREAMLIT-002
+MAT-RHBOLSAS-STREAMLIT-003 (versão 100% nativa)
 
 Login: RH / RH@123
+
+DECISÃO DE ARQUITETURA (por que essa versão existe):
+O Streamlit Cloud roda num ambiente isolado que só instala o que está
+listado em requirements.txt — nada é "nativo do sistema" além disso. Toda
+vez que dependemos de libs pesadas (openpyxl, plotly, xlrd, reportlab) e o
+requirements.txt não é lido corretamente pela plataforma, o app quebra com
+ModuleNotFoundError. Pra eliminar essa classe inteira de erro, esta versão:
+
+  - NÃO usa openpyxl/xlrd: lê .xlsx "na unha" com zipfile + xml.etree
+    (ambos da biblioteca padrão do Python — sempre disponíveis, sem
+    instalação nenhuma, em qualquer ambiente).
+  - NÃO usa plotly: usa Altair, que já vem instalado automaticamente como
+    dependência do próprio Streamlit (confirmado no log de deploy).
+  - NÃO usa reportlab/PyPDF: gera um relatório HTML com CSS de impressão
+    (@media print) pronto pra "Salvar como PDF" direto do navegador —
+    zero dependência.
+  - requirements.txt fica só com streamlit + pandas + altair (as duas
+    últimas já vêm junto do streamlit de qualquer forma).
 
 Fonte de dados (ordem de prioridade) — SEMPRE a planilha real completa,
 todas as abas, todas as colunas, estrutura original preservada:
   1) GET do workbook público completo (.xlsx, todas as abas) via export do
-     Google Sheets — NÃO usa CSV de aba única, porque CSV exporta só 1 aba.
-  2) Upload manual de arquivo .xlsx / .xls / .csv completo.
+     Google Sheets.
+  2) Upload manual de arquivo .xlsx ou .csv completo.
   3) Cópia local da planilha real (fallback offline), mesma estrutura.
 Regra dura: 100% dos registros e 100% das abas — sem amostragem, sem
 recorte para 1 aba só, sem invenção de linha/valor/coluna.
 """
 import io
+import re
+import zipfile
 import datetime
-import requests
-import pandas as pd
-import openpyxl
-import streamlit as st
-import plotly.express as px
+import urllib.request
+import xml.etree.ElementTree as ET
 
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+import pandas as pd
+import streamlit as st
+import altair as alt
 
 # ==========================================================================
 # CONFIG
 # ==========================================================================
-APP_VERSION = "v1.2.0"
+APP_VERSION = "v2.0.0-nativo"
 APP_TITLE = "Painel RH TJMA · Auxílio-Bolsa"
 LOGIN_USER = "RH"
 LOGIN_PASS = "RH@123"
 
-# ID atualizado (planilha nova compartilhada por link público)
 GOOGLE_SHEET_ID = "1iaXdM3maNqnvhnz7-KvGE4CL0mQDoVUjUpLjDEsipqg"
-# export?format=xlsx traz o WORKBOOK INTEIRO (todas as abas), diferente do
-# export?format=csv que só traz 1 aba (gid). É por isso que a fonte primária
-# do GET precisa ser xlsx, não csv, quando a exigência é "todas as abas".
 XLSX_PUBLICO_URL = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=xlsx"
 
 XLSX_LOCAL_FALLBACK = "planilha_bolsas_COM_FILTROS.xlsx"
@@ -56,11 +67,246 @@ TAG_LABELS = {
     "IDENTIFICADO-SEM-STATUS-REGISTRADO": ("Sem status registrado", "➖"),
 }
 
-# Colunas candidatas a filtro/gráfico, na ordem de prioridade — só aparecem
-# na UI se realmente existirem na aba selecionada (nada é forçado).
 COLUNAS_PRIORITARIAS = ["TAG_TIPOLOGIA", "STATUS", "COMARCA", "TIPO DE BOLSA", "CARGO"]
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🎓", layout="wide")
+
+# ==========================================================================
+# LEITOR NATIVO DE .XLSX — só biblioteca padrão (zipfile + xml.etree)
+# Um arquivo .xlsx é um .zip contendo XMLs (formato OOXML). Aqui a gente
+# abre o zip direto e lê os XMLs internos, sem nenhuma lib de terceiros.
+# ==========================================================================
+_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_NS_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_NS_PKG_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _col_letra_para_indice(ref: str) -> int:
+    """'A1' -> 0, 'B7' -> 1, 'AA3' -> 26 ..."""
+    letras = re.match(r"[A-Za-z]+", ref)
+    letras = letras.group(0).upper() if letras else "A"
+    idx = 0
+    for ch in letras:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _ler_shared_strings(z: zipfile.ZipFile):
+    if "xl/sharedStrings.xml" not in z.namelist():
+        return []
+    tree = ET.fromstring(z.read("xl/sharedStrings.xml"))
+    out = []
+    for si in tree.findall(f"{_NS}si"):
+        texto = "".join(t.text or "" for t in si.findall(f".//{_NS}t"))
+        out.append(texto)
+    return out
+
+
+def _ler_lista_abas(z: zipfile.ZipFile):
+    """Retorna [(nome_aba, caminho_xml)] respeitando a ordem real do workbook."""
+    wb_tree = ET.fromstring(z.read("xl/workbook.xml"))
+    rels_tree = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+
+    rid_para_target = {}
+    for rel in rels_tree.findall(f"{_NS_PKG_REL}Relationship"):
+        rid_para_target[rel.get("Id")] = rel.get("Target")
+
+    abas = []
+    sheets_el = wb_tree.find(f"{_NS}sheets")
+    if sheets_el is None:
+        return abas
+    for sheet in sheets_el.findall(f"{_NS}sheet"):
+        nome = sheet.get("name")
+        rid = sheet.get(f"{_NS_R}id")
+        target = rid_para_target.get(rid)
+        if not target:
+            continue
+        if target.startswith("/"):
+            target = target[1:]
+        elif not target.startswith("xl/"):
+            target = "xl/" + target
+        abas.append((nome, target))
+    return abas
+
+
+def _ler_matriz_da_aba(z: zipfile.ZipFile, caminho: str, shared_strings):
+    tree = ET.fromstring(z.read(caminho))
+    sheet_data = tree.find(f"{_NS}sheetData")
+    if sheet_data is None:
+        return []
+
+    linhas_dict = []
+    for row in sheet_data.findall(f"{_NS}row"):
+        celulas = {}
+        max_idx = -1
+        for c in row.findall(f"{_NS}c"):
+            ref = c.get("r", "")
+            idx = _col_letra_para_indice(ref) if ref else max_idx + 1
+            tipo = c.get("t")
+            v_el = c.find(f"{_NS}v")
+            is_el = c.find(f"{_NS}is")
+
+            valor = None
+            if tipo == "s" and v_el is not None and v_el.text is not None:
+                pos = int(v_el.text)
+                valor = shared_strings[pos] if pos < len(shared_strings) else ""
+            elif tipo == "inlineStr" and is_el is not None:
+                valor = "".join(t.text or "" for t in is_el.findall(f".//{_NS}t"))
+            elif tipo == "b" and v_el is not None:
+                valor = bool(int(v_el.text))
+            elif v_el is not None and v_el.text is not None:
+                bruto = v_el.text
+                try:
+                    numero = float(bruto)
+                    valor = int(numero) if numero.is_integer() else numero
+                except ValueError:
+                    valor = bruto
+
+            celulas[idx] = valor
+            max_idx = max(max_idx, idx)
+        linhas_dict.append((max_idx, celulas))
+
+    if not linhas_dict:
+        return []
+    n_col = max(m for m, _ in linhas_dict) + 1
+    matriz = [[celulas.get(i) for i in range(n_col)] for _, celulas in linhas_dict]
+    return matriz
+
+
+def _detectar_linha_cabecalho(matriz):
+    if len(matriz) < 2:
+        return 0
+    r1 = sum(1 for v in matriz[0] if v not in (None, ""))
+    r2 = sum(1 for v in matriz[1] if v not in (None, ""))
+    return 1 if (r1 <= 2 and r2 > r1) else 0
+
+
+def _dedup_headers(headers):
+    vistos, final = {}, []
+    for h in headers:
+        vistos[h] = vistos.get(h, 0) + 1
+        final.append(h if vistos[h] == 1 else f"{h} ({vistos[h]})")
+    return final
+
+
+def ler_workbook_nativo(fonte) -> dict:
+    """Lê TODAS as abas de um .xlsx usando só a biblioteca padrão do Python.
+    `fonte` pode ser um caminho de arquivo, bytes, ou um objeto tipo-arquivo."""
+    with zipfile.ZipFile(fonte) as z:
+        shared_strings = _ler_shared_strings(z)
+        lista_abas = _ler_lista_abas(z)
+        nomes_no_zip = set(z.namelist())
+
+        abas = {}
+        for nome, caminho in lista_abas:
+            if caminho not in nomes_no_zip:
+                continue
+            matriz = _ler_matriz_da_aba(z, caminho, shared_strings)
+            if len(matriz) < 2:
+                continue
+
+            header_idx = _detectar_linha_cabecalho(matriz)
+            headers_raw = matriz[header_idx]
+            col_idx_validas = [i for i, h in enumerate(headers_raw) if h not in (None, "")]
+            if not col_idx_validas:
+                continue
+            headers = [str(headers_raw[i]) for i in col_idx_validas]
+
+            linhas = []
+            for linha in matriz[header_idx + 1:]:
+                vals = [linha[i] if i < len(linha) else None for i in col_idx_validas]
+                if all(v in (None, "") for v in vals):
+                    continue
+                linhas.append(vals)
+
+            abas[nome] = pd.DataFrame(linhas, columns=_dedup_headers(headers))
+    return abas
+
+
+def ler_csv_nativo(fonte) -> dict:
+    """CSV só tem 1 tabela por definição — usa só pandas (já vem com o
+    streamlit), detectando separador ',' ou ';' automaticamente."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    try:
+        df = pd.read_csv(fonte, sep=None, engine="python", encoding="utf-8-sig")
+    except Exception:
+        if hasattr(fonte, "seek"):
+            fonte.seek(0)
+        df = pd.read_csv(fonte, sep=";", engine="python", encoding="latin-1")
+    df = df.dropna(how="all")
+    df.columns = _dedup_headers([str(c) for c in df.columns])
+    return {"Dados (CSV)": df.reset_index(drop=True)}
+
+
+def ler_arquivo_por_extensao(fonte, nome_arquivo: str) -> dict:
+    ext = nome_arquivo.lower().rsplit(".", 1)[-1]
+    if ext == "xlsx":
+        return ler_workbook_nativo(fonte)
+    if ext == "csv":
+        return ler_csv_nativo(fonte)
+    raise ValueError(
+        f"Extensão .{ext} não suportada nesta versão nativa. "
+        "Use .xlsx (Excel moderno) ou .csv. Arquivo .xls antigo: "
+        "abra no Google Sheets/Excel e salve como .xlsx primeiro."
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_de_xlsx_publico(url: str):
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            conteudo = resp.read()
+        abas = ler_workbook_nativo(io.BytesIO(conteudo))
+        return abas if abas else None
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def carregar_de_xlsx_local(path: str):
+    try:
+        abas = ler_workbook_nativo(path)
+        return abas if abas else None
+    except Exception:
+        return None
+
+
+def carregar_de_upload(arquivo):
+    try:
+        abas = ler_arquivo_por_extensao(arquivo, arquivo.name)
+        return abas if abas else None
+    except Exception as e:
+        st.sidebar.error(f"Falha ao ler o arquivo enviado: {e}")
+        return None
+
+
+def obter_dados():
+    st.sidebar.markdown("### 📥 Fonte de dados")
+    upload = st.sidebar.file_uploader(
+        "Upload manual (.xlsx ou .csv) — alternativa ao GET público",
+        type=["xlsx", "csv"]
+    )
+
+    if upload is not None:
+        abas = carregar_de_upload(upload)
+        if abas:
+            st.sidebar.success(f"Carregado do upload manual · {len(abas)} aba(s)")
+            return abas, f"Upload manual ({upload.name})"
+
+    abas = carregar_de_xlsx_publico(XLSX_PUBLICO_URL)
+    if abas:
+        st.sidebar.success(f"Carregado via GET público (workbook completo) · {len(abas)} aba(s)")
+        return abas, "GET público — workbook completo (.xlsx)"
+
+    abas = carregar_de_xlsx_local(XLSX_LOCAL_FALLBACK)
+    if abas:
+        st.sidebar.warning(f"GET público falhou — usando cópia local da planilha real · {len(abas)} aba(s)")
+        return abas, "Cópia local da planilha real (fallback)"
+
+    st.sidebar.error("Nenhuma fonte de dados disponível (GET, upload e cópia local falharam).")
+    return {}, "Nenhuma"
+
 
 # ==========================================================================
 # ESTILO — verde / branco / azul + tema escuro (azul/branco), contraste OK
@@ -115,162 +361,7 @@ def tela_login():
 
 
 # ==========================================================================
-# LEITURA FIEL DA PLANILHA REAL — TODAS AS ABAS, TODAS AS COLUNAS (.xlsx)
-# (mesma lógica das etapas de sanitização já validadas: detecta banner
-# mesclado, cabeçalho real, última linha real; remove só o 100% vazio)
-# ==========================================================================
-def _detect_header_row(ws):
-    row1_filled = sum(1 for c in ws[1] if c.value not in (None, ""))
-    row2_filled = sum(1 for c in ws[2] if c.value not in (None, "")) if ws.max_row >= 2 else 0
-    return 2 if (row1_filled <= 2 and row2_filled > row1_filled) else 1
-
-
-def _last_data_row(ws, header_row):
-    last_row = header_row
-    for row in ws.iter_rows(min_row=header_row):
-        if any(c.value not in (None, "") for c in row):
-            last_row = row[0].row
-    return last_row
-
-
-def _dedup_headers(headers):
-    vistos = {}
-    headers_final = []
-    for h in headers:
-        vistos[h] = vistos.get(h, 0) + 1
-        headers_final.append(h if vistos[h] == 1 else f"{h} ({vistos[h]})")
-    return headers_final
-
-
-def ler_workbook_xlsx(source) -> dict:
-    """Lê TODAS as abas de um .xlsx, preservando cabeçalho/estrutura reais de
-    cada aba (independentes entre si). Retorna {nome_aba: DataFrame}."""
-    wb = openpyxl.load_workbook(source, data_only=True)
-    abas = {}
-    for nome in wb.sheetnames:
-        ws = wb[nome]
-        header_row = _detect_header_row(ws)
-        end_row = _last_data_row(ws, header_row)
-        if end_row <= header_row:
-            continue
-
-        headers_raw = [c.value for c in ws[header_row]]
-        col_idx_validas = [i + 1 for i, h in enumerate(headers_raw) if h not in (None, "")]
-        if not col_idx_validas:
-            continue
-        headers = [headers_raw[i - 1] for i in col_idx_validas]
-
-        rows = []
-        for r in range(header_row + 1, end_row + 1):
-            vals = [ws.cell(row=r, column=c).value for c in col_idx_validas]
-            if all(v in (None, "") for v in vals):
-                continue
-            rows.append(vals)
-
-        abas[nome] = pd.DataFrame(rows, columns=_dedup_headers(headers))
-    return abas
-
-
-def ler_workbook_xls(source) -> dict:
-    """Lê TODAS as abas de um .xls antigo (formato binário) via pandas/xlrd.
-    Sem a detecção fina de banner mesclado (não se aplica ao .xls antigo);
-    assume cabeçalho na primeira linha não totalmente vazia."""
-    planilhas = pd.read_excel(source, sheet_name=None, engine="xlrd", header=0)
-    abas = {}
-    for nome, df in planilhas.items():
-        df = df.dropna(how="all")
-        if df.empty:
-            continue
-        df.columns = _dedup_headers([str(c) for c in df.columns])
-        abas[nome] = df.reset_index(drop=True)
-    return abas
-
-
-def ler_csv(source) -> dict:
-    """CSV só tem 1 aba/tabela por definição. Tenta detectar separador e
-    encoding automaticamente (';' é comum em export de planilhas BR)."""
-    if hasattr(source, "seek"):
-        source.seek(0)
-    try:
-        df = pd.read_csv(source, sep=None, engine="python", encoding="utf-8-sig")
-    except Exception:
-        if hasattr(source, "seek"):
-            source.seek(0)
-        df = pd.read_csv(source, sep=";", engine="python", encoding="latin-1")
-    df = df.dropna(how="all")
-    df.columns = _dedup_headers([str(c) for c in df.columns])
-    return {"Dados (CSV)": df.reset_index(drop=True)}
-
-
-def ler_arquivo_por_extensao(source, nome_arquivo: str) -> dict:
-    ext = nome_arquivo.lower().rsplit(".", 1)[-1]
-    if ext == "xlsx":
-        return ler_workbook_xlsx(source)
-    if ext == "xls":
-        return ler_workbook_xls(source)
-    if ext == "csv":
-        return ler_csv(source)
-    raise ValueError(f"Extensão não suportada: .{ext}")
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def carregar_de_xlsx_publico(url: str):
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        abas = ler_workbook_xlsx(io.BytesIO(resp.content))
-        return abas if abas else None
-    except Exception:
-        return None
-
-
-@st.cache_data(show_spinner=False)
-def carregar_de_xlsx_local(path: str):
-    try:
-        abas = ler_workbook_xlsx(path)
-        return abas if abas else None
-    except Exception:
-        return None
-
-
-def carregar_de_upload(arquivo):
-    try:
-        abas = ler_arquivo_por_extensao(arquivo, arquivo.name)
-        return abas if abas else None
-    except Exception as e:
-        st.sidebar.error(f"Falha ao ler o arquivo enviado: {e}")
-        return None
-
-
-def obter_dados():
-    st.sidebar.markdown("### 📥 Fonte de dados")
-    upload = st.sidebar.file_uploader(
-        "Upload manual (.xlsx / .xls / .csv) — alternativa ao GET público",
-        type=["xlsx", "xls", "csv"]
-    )
-
-    if upload is not None:
-        abas = carregar_de_upload(upload)
-        if abas:
-            st.sidebar.success(f"Carregado do upload manual · {len(abas)} aba(s)")
-            return abas, f"Upload manual ({upload.name})"
-
-    abas = carregar_de_xlsx_publico(XLSX_PUBLICO_URL)
-    if abas:
-        st.sidebar.success(f"Carregado via GET público (workbook completo) · {len(abas)} aba(s)")
-        return abas, "GET público — workbook completo (.xlsx)"
-
-    abas = carregar_de_xlsx_local(XLSX_LOCAL_FALLBACK)
-    if abas:
-        st.sidebar.warning(f"GET público falhou — usando cópia local da planilha real · {len(abas)} aba(s)")
-        return abas, "Cópia local da planilha real (fallback)"
-
-    st.sidebar.error("Nenhuma fonte de dados disponível (GET, upload e cópia local falharam).")
-    return {}, "Nenhuma"
-
-
-# ==========================================================================
-# PAINEL GERAL (visão de todas as abas — como o router da planilha original)
+# PAINEL GERAL (visão de todas as abas)
 # ==========================================================================
 def montar_painel_geral(abas: dict):
     st.markdown("### 📁 Painel — todas as abas da planilha real")
@@ -280,7 +371,7 @@ def montar_painel_geral(abas: dict):
 
 
 # ==========================================================================
-# KPIs, FILTROS E GRÁFICOS — por aba selecionada, 100% dinâmico
+# KPIs, FILTROS
 # ==========================================================================
 def montar_kpis(df: pd.DataFrame):
     total = len(df)
@@ -321,35 +412,78 @@ def montar_filtros(df: pd.DataFrame, chave: str) -> pd.DataFrame:
     return df_filtrado
 
 
+# ==========================================================================
+# GRÁFICOS — Altair (já vem junto do Streamlit, sem instalar nada extra)
+# ==========================================================================
+def _grafico_pizza(df, col, titulo, azul, verde):
+    cont = df[col].value_counts(dropna=True).reset_index()
+    cont.columns = ["Situação", "Registros"]
+    if col == "TAG_TIPOLOGIA":
+        cont["Situação"] = cont["Situação"].map(lambda t: TAG_LABELS.get(t, (t, ""))[0])
+    paleta = [azul, verde, "#F59E0B", "#EF4444", "#94A3B8", "#8B5CF6", "#0EA5E9"]
+    return (
+        alt.Chart(cont)
+        .mark_arc(innerRadius=60)
+        .encode(
+            theta=alt.Theta("Registros:Q"),
+            color=alt.Color("Situação:N", scale=alt.Scale(range=paleta)),
+            tooltip=["Situação", "Registros"],
+        )
+        .properties(title=titulo, height=320)
+    )
+
+
+def _grafico_barras(df, col, titulo, cor, horizontal=False, top=None):
+    cont = df[col].value_counts(dropna=True).reset_index()
+    cont.columns = [col, "Registros"]
+    if top:
+        cont = cont.head(top)
+    if horizontal:
+        chart = (
+            alt.Chart(cont)
+            .mark_bar(color=cor)
+            .encode(
+                x="Registros:Q",
+                y=alt.Y(f"{col}:N", sort="-x", title=None),
+                tooltip=[col, "Registros"],
+            )
+        )
+    else:
+        chart = (
+            alt.Chart(cont)
+            .mark_bar(color=cor)
+            .encode(
+                x=alt.X(f"{col}:N", sort="-y", title=None),
+                y="Registros:Q",
+                tooltip=[col, "Registros"],
+            )
+        )
+    return chart.properties(title=titulo, height=320)
+
+
 def montar_graficos(df: pd.DataFrame, azul, verde):
     col1, col2 = st.columns(2)
     tem_grafico = False
 
     if "TAG_TIPOLOGIA" in df.columns:
-        cont = df["TAG_TIPOLOGIA"].value_counts(dropna=True).reset_index()
-        cont.columns = ["Situação", "Registros"]
-        cont["Situação"] = cont["Situação"].map(lambda t: TAG_LABELS.get(t, (t, ""))[0])
-        fig1 = px.pie(cont, names="Situação", values="Registros",
-                      title="Distribuição por situação (TAG_TIPOLOGIA)",
-                      color_discrete_sequence=[azul, verde, "#F59E0B", "#EF4444", "#94A3B8", "#8B5CF6", "#0EA5E9"])
-        col1.plotly_chart(fig1, use_container_width=True)
+        col1.altair_chart(
+            _grafico_pizza(df, "TAG_TIPOLOGIA", "Distribuição por situação (TAG_TIPOLOGIA)", azul, verde),
+            use_container_width=True,
+        )
         tem_grafico = True
 
     if "TIPO DE BOLSA" in df.columns:
-        cont2 = df["TIPO DE BOLSA"].value_counts(dropna=True).reset_index()
-        cont2.columns = ["Tipo de bolsa", "Registros"]
-        fig2 = px.bar(cont2, x="Tipo de bolsa", y="Registros",
-                      title="Registros por tipo de bolsa", color_discrete_sequence=[verde])
-        col2.plotly_chart(fig2, use_container_width=True)
+        col2.altair_chart(
+            _grafico_barras(df, "TIPO DE BOLSA", "Registros por tipo de bolsa", verde),
+            use_container_width=True,
+        )
         tem_grafico = True
 
     if "COMARCA" in df.columns:
-        cont3 = df["COMARCA"].value_counts(dropna=True).reset_index().head(15)
-        cont3.columns = ["Comarca", "Registros"]
-        fig3 = px.bar(cont3, x="Registros", y="Comarca", orientation="h",
-                      title="Top 15 comarcas por nº de registros", color_discrete_sequence=[azul])
-        fig3.update_layout(yaxis=dict(autorange="reversed"))
-        st.plotly_chart(fig3, use_container_width=True)
+        st.altair_chart(
+            _grafico_barras(df, "COMARCA", "Top 15 comarcas por nº de registros", azul, horizontal=True, top=15),
+            use_container_width=True,
+        )
         tem_grafico = True
 
     if not tem_grafico:
@@ -357,53 +491,53 @@ def montar_graficos(df: pd.DataFrame, azul, verde):
 
 
 # ==========================================================================
-# EXPORT PDF — relatório dos dados filtrados (paisagem, paginado)
+# EXPORT — CSV nativo + relatório HTML pronto para "Salvar como PDF"
 # ==========================================================================
-def gerar_pdf_relatorio(df: pd.DataFrame, nome_aba: str, origem: str) -> bytes:
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=landscape(A4),
-        leftMargin=1.2 * cm, rightMargin=1.2 * cm, topMargin=1.2 * cm, bottomMargin=1.2 * cm,
+def gerar_relatorio_html(df: pd.DataFrame, nome_aba: str, origem: str) -> str:
+    linhas_html = "\n".join(
+        "<tr>" + "".join(f"<td>{'' if v is None else v}</td>" for v in linha) + "</tr>"
+        for linha in df.astype(str).values.tolist()
     )
-    estilos = getSampleStyleSheet()
-    elementos = []
+    colunas_html = "".join(f"<th>{c}</th>" for c in df.columns)
 
-    elementos.append(Paragraph(f"<b>{APP_TITLE}</b>", estilos["Title"]))
-    elementos.append(Paragraph(f"Aba: {nome_aba} · Fonte: {origem}", estilos["Normal"]))
-    elementos.append(Paragraph(
-        f"Gerado em {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')} · {len(df)} registro(s) após filtro",
-        estilos["Normal"]
-    ))
-    elementos.append(Spacer(1, 0.5 * cm))
-
-    # Limita colunas exibidas no PDF para não estourar a largura da página;
-    # a tabela completa continua disponível no CSV/na tela.
-    MAX_COLS_PDF = 8
-    colunas_pdf = list(df.columns[:MAX_COLS_PDF])
-    if len(df.columns) > MAX_COLS_PDF:
-        elementos.append(Paragraph(
-            f"⚠ Exibindo as primeiras {MAX_COLS_PDF} colunas de {len(df.columns)} "
-            f"(exporte em CSV para ver a planilha completa).",
-            estilos["Normal"]
-        ))
-        elementos.append(Spacer(1, 0.3 * cm))
-
-    dados_tabela = [colunas_pdf] + df[colunas_pdf].astype(str).values.tolist()
-
-    tabela = Table(dados_tabela, repeatRows=1)
-    tabela.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1D4ED8")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 7),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6E4DC")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F8F4")]),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    elementos.append(tabela)
-
-    doc.build(elementos)
-    buffer.seek(0)
-    return buffer.getvalue()
+    return f"""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<title>{APP_TITLE} — {nome_aba}</title>
+<style>
+  @page {{ size: A4 landscape; margin: 1.2cm; }}
+  body {{ font-family: Arial, Helvetica, sans-serif; color: #0B1220; }}
+  h1 {{ color: #1D4ED8; font-size: 18px; margin-bottom: 2px; }}
+  .meta {{ color: #555; font-size: 11px; margin-bottom: 14px; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 10px; }}
+  th, td {{ border: 1px solid #D6E4DC; padding: 4px 6px; text-align: left; }}
+  th {{ background: #1D4ED8; color: #fff; }}
+  tr:nth-child(even) {{ background: #F3F8F4; }}
+  .dica-impressao {{
+      background: #FEF3C7; border: 1px solid #F59E0B; padding: 8px 12px;
+      border-radius: 6px; font-size: 12px; margin-bottom: 14px;
+  }}
+  @media print {{ .dica-impressao {{ display: none; }} }}
+</style>
+</head>
+<body>
+  <div class="dica-impressao">
+    📄 Para gerar o PDF: pressione <b>Ctrl+P</b> (ou Cmd+P no Mac), escolha
+    "Salvar como PDF" e orientação "Paisagem". Este aviso não aparece na impressão.
+  </div>
+  <h1>🎓 {APP_TITLE}</h1>
+  <div class="meta">
+    Aba: {nome_aba} · Fonte: {origem} ·
+    Gerado em {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')} ·
+    {len(df)} registro(s) após filtro
+  </div>
+  <table>
+    <thead><tr>{colunas_html}</tr></thead>
+    <tbody>{linhas_html}</tbody>
+  </table>
+</body>
+</html>"""
 
 
 def montar_tabela_e_export(df: pd.DataFrame, nome_aba: str, origem: str):
@@ -425,18 +559,14 @@ def montar_tabela_e_export(df: pd.DataFrame, nome_aba: str, origem: str):
         use_container_width=True,
     )
 
-    if col_pdf.button("🧾 Gerar relatório PDF", use_container_width=True):
-        if df.empty:
-            st.warning("Não há registros para gerar o PDF com os filtros atuais.")
-        else:
-            pdf_bytes = gerar_pdf_relatorio(df, nome_aba, origem)
-            col_pdf.download_button(
-                "⬇️ Baixar PDF gerado",
-                data=pdf_bytes,
-                file_name=f"RH_TJMA_relatorio_{slug}_{timestamp}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
+    html_bytes = gerar_relatorio_html(df, nome_aba, origem).encode("utf-8")
+    col_pdf.download_button(
+        "🧾 Baixar relatório (abrir e Ctrl+P → PDF)",
+        data=html_bytes,
+        file_name=f"RH_TJMA_relatorio_{slug}_{timestamp}.html",
+        mime="text/html",
+        use_container_width=True,
+    )
 
 
 def rodape():
