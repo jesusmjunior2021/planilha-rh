@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-app.py — Painel RH TJMA ·
-Adm. JMOJ-V1.107805
+app.py — Painel RH TJMA · Auxílio-Bolsa (GDG)
+Adm. Jesus Martins Oliveira Junior — COGEX-MA/TJMA
 MAT-RHBOLSAS-STREAMLIT-002
 
 Login: RH / RH@123
@@ -19,7 +19,9 @@ import io
 import datetime
 import requests
 import pandas as pd
+import openpyxl
 import streamlit as st
+import plotly.express as px
 
 # ==========================================================================
 # CONFIG
