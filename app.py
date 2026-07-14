@@ -35,6 +35,7 @@ recorte para 1 aba só, sem invenção de linha/valor/coluna.
 """
 import io
 import re
+import json
 import zipfile
 import datetime
 import urllib.request
@@ -43,6 +44,7 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import streamlit as st
 import altair as alt
+import streamlit.components.v1 as components
 
 # ==========================================================================
 # CONFIG
@@ -237,6 +239,92 @@ def ler_csv_nativo(fonte) -> dict:
     df = df.dropna(how="all")
     df.columns = _dedup_headers([str(c) for c in df.columns])
     return {"Dados (CSV)": df.reset_index(drop=True)}
+
+
+# ==========================================================================
+# ESCRITOR NATIVO DE .XLSX — pra oferecer download em Excel, sem openpyxl
+# ==========================================================================
+def _indice_para_col_letra(idx: int) -> str:
+    letras = ""
+    idx += 1
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letras = chr(65 + rem) + letras
+    return letras
+
+
+def gerar_xlsx_nativo(df: pd.DataFrame, nome_aba: str = "Dados") -> bytes:
+    """Gera um .xlsx válido (mínimo, 1 aba) usando só zipfile + strings XML —
+    sem nenhuma lib de terceiros. Suficiente pra exportar dados filtrados."""
+    from xml.sax.saxutils import escape as xml_escape
+
+    nome_aba_seguro = re.sub(r'[\\/*?:\[\]]', "_", str(nome_aba))[:31] or "Dados"
+
+    linhas_xml = []
+    header_cells = [
+        f'<c r="{_indice_para_col_letra(i)}1" t="inlineStr"><is><t>{xml_escape(str(col))}</t></is></c>'
+        for i, col in enumerate(df.columns)
+    ]
+    linhas_xml.append(f'<row r="1">{"".join(header_cells)}</row>')
+
+    for r_idx, row in enumerate(df.itertuples(index=False), start=2):
+        cells = []
+        for c_idx, val in enumerate(row):
+            ref = f"{_indice_para_col_letra(c_idx)}{r_idx}"
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                cells.append(f'<c r="{ref}"><v>{val}</v></c>')
+            else:
+                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{xml_escape(str(val))}</t></is></c>')
+        linhas_xml.append(f'<row r="{r_idx}">{"".join(cells)}</row>')
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(linhas_xml)}</sheetData></worksheet>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        "</Types>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets><sheet name="{xml_escape(nome_aba_seguro)}" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        "</Relationships>"
+    )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buffer.getvalue()
+
+
+def _hex_para_rgb(hex_color: str):
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def ler_arquivo_por_extensao(fonte, nome_arquivo: str) -> dict:
@@ -491,56 +579,104 @@ def montar_graficos(df: pd.DataFrame, azul, verde):
 
 
 # ==========================================================================
-# EXPORT — CSV nativo + relatório HTML pronto para "Salvar como PDF"
+# EXPORT — CSV nativo · XLSX nativo · PDF real via jsPDF (CDN, no navegador)
+# jsPDF roda inteiramente no browser do usuário: zero instalação em Python,
+# zero servidor, apenas um <script> carregado via CDN (igual o resto da UI).
+# (pdf.js, em contraste, serve pra *ler/exibir* PDF — não pra gerar um.)
 # ==========================================================================
-def gerar_relatorio_html(df: pd.DataFrame, nome_aba: str, origem: str) -> str:
-    linhas_html = "\n".join(
-        "<tr>" + "".join(f"<td>{'' if v is None else v}</td>" for v in linha) + "</tr>"
-        for linha in df.astype(str).values.tolist()
+def _preparar_dados_para_pdf(df: pd.DataFrame):
+    df_limpo = df.astype(object).where(pd.notnull(df), "")
+    linhas = []
+    for linha in df_limpo.values.tolist():
+        linha_serializavel = []
+        for v in linha:
+            if isinstance(v, (int, float, str, bool)):
+                linha_serializavel.append(v)
+            else:
+                linha_serializavel.append(str(v))
+        linhas.append(linha_serializavel)
+    return linhas
+
+
+def montar_botao_pdf_js(df: pd.DataFrame, nome_aba: str, origem: str, azul_hex: str, chave: str):
+    MAX_LINHAS_PDF = 2000  # trava de segurança pra não travar o navegador em abas gigantes
+    aviso = ""
+    df_pdf = df
+    if len(df) > MAX_LINHAS_PDF:
+        df_pdf = df.head(MAX_LINHAS_PDF)
+        aviso = f" (mostrando as primeiras {MAX_LINHAS_PDF} de {len(df)} linhas — use o CSV/XLSX pra ver tudo)"
+
+    colunas = list(df_pdf.columns)
+    linhas = _preparar_dados_para_pdf(df_pdf)
+    r, g, b = _hex_para_rgb(azul_hex)
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", nome_aba.strip())
+    nome_arquivo = f"RH_TJMA_relatorio_{slug}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+    titulo_txt = f"{APP_TITLE} — {nome_aba}"
+    subtitulo_txt = (
+        f"Fonte: {origem} · Gerado em {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')} "
+        f"· {len(df_pdf)} registro(s){aviso}"
     )
-    colunas_html = "".join(f"<th>{c}</th>" for c in df.columns)
 
-    return f"""<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-<meta charset="utf-8">
-<title>{APP_TITLE} — {nome_aba}</title>
-<style>
-  @page {{ size: A4 landscape; margin: 1.2cm; }}
-  body {{ font-family: Arial, Helvetica, sans-serif; color: #0B1220; }}
-  h1 {{ color: #1D4ED8; font-size: 18px; margin-bottom: 2px; }}
-  .meta {{ color: #555; font-size: 11px; margin-bottom: 14px; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 10px; }}
-  th, td {{ border: 1px solid #D6E4DC; padding: 4px 6px; text-align: left; }}
-  th {{ background: #1D4ED8; color: #fff; }}
-  tr:nth-child(even) {{ background: #F3F8F4; }}
-  .dica-impressao {{
-      background: #FEF3C7; border: 1px solid #F59E0B; padding: 8px 12px;
-      border-radius: 6px; font-size: 12px; margin-bottom: 14px;
-  }}
-  @media print {{ .dica-impressao {{ display: none; }} }}
-</style>
-</head>
-<body>
-  <div class="dica-impressao">
-    📄 Para gerar o PDF: pressione <b>Ctrl+P</b> (ou Cmd+P no Mac), escolha
-    "Salvar como PDF" e orientação "Paisagem". Este aviso não aparece na impressão.
-  </div>
-  <h1>🎓 {APP_TITLE}</h1>
-  <div class="meta">
-    Aba: {nome_aba} · Fonte: {origem} ·
-    Gerado em {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')} ·
-    {len(df)} registro(s) após filtro
-  </div>
-  <table>
-    <thead><tr>{colunas_html}</tr></thead>
-    <tbody>{linhas_html}</tbody>
-  </table>
-</body>
-</html>"""
+    colunas_json = json.dumps(colunas, ensure_ascii=False)
+    linhas_json = json.dumps(linhas, ensure_ascii=False)
+    titulo_json = json.dumps(titulo_txt, ensure_ascii=False)
+    subtitulo_json = json.dumps(subtitulo_txt, ensure_ascii=False)
+    nome_arquivo_json = json.dumps(nome_arquivo, ensure_ascii=False)
+    btn_id = f"btnPdf_{chave}"
+
+    html = f"""
+    <div style="font-family: Arial, Helvetica, sans-serif;">
+      <button id="{btn_id}"
+        style="width:100%; padding:10px 14px; border-radius:8px; border:none;
+               background:{azul_hex}; color:#fff; font-weight:600; font-size:14px;
+               cursor:pointer;">
+        🧾 Baixar PDF (gerado no navegador)
+      </button>
+      <div id="{btn_id}_status" style="font-size:12px; color:#888; margin-top:4px;"></div>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/4.0.0/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/5.0.8/jspdf.plugin.autotable.min.js"></script>
+    <script>
+      (function() {{
+        const colunas = {colunas_json};
+        const linhas = {linhas_json};
+        const titulo = {titulo_json};
+        const subtitulo = {subtitulo_json};
+        const nomeArquivo = {nome_arquivo_json};
+        const botao = document.getElementById("{btn_id}");
+        const status = document.getElementById("{btn_id}_status");
+
+        botao.addEventListener("click", function() {{
+          try {{
+            status.textContent = "Gerando PDF...";
+            const doc = new jspdf.jsPDF({{ orientation: "landscape" }});
+            doc.setFontSize(14);
+            doc.text(titulo, 14, 15);
+            doc.setFontSize(9);
+            doc.text(subtitulo, 14, 21);
+            doc.autoTable({{
+              head: [colunas],
+              body: linhas,
+              startY: 26,
+              styles: {{ fontSize: 7, cellPadding: 2, overflow: "linebreak" }},
+              headStyles: {{ fillColor: [{r}, {g}, {b}], textColor: 255 }},
+              alternateRowStyles: {{ fillColor: [243, 248, 244] }},
+              theme: "grid",
+              horizontalPageBreak: true,
+            }});
+            doc.save(nomeArquivo);
+            status.textContent = "PDF gerado ✅";
+          }} catch (err) {{
+            status.textContent = "Erro ao gerar PDF: " + err.message;
+          }}
+        }});
+      }})();
+    </script>
+    """
+    components.html(html, height=80)
 
 
-def montar_tabela_e_export(df: pd.DataFrame, nome_aba: str, origem: str):
+def montar_tabela_e_export(df: pd.DataFrame, nome_aba: str, origem: str, azul_hex: str):
     st.markdown(f"### 📋 Registros — {nome_aba}")
     st.caption(f"{len(df)} registro(s) após filtro")
     st.dataframe(df, use_container_width=True, height=420)
@@ -548,25 +684,29 @@ def montar_tabela_e_export(df: pd.DataFrame, nome_aba: str, origem: str):
     slug = nome_aba.strip().replace(" ", "_").replace("/", "-")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
 
-    col_csv, col_pdf = st.columns(2)
+    st.markdown("##### ⬇️ Exportar dados filtrados")
+    col_csv, col_xlsx, col_pdf = st.columns(3)
 
     csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     col_csv.download_button(
-        "⬇️ Exportar CSV (RH TJMA)",
+        "📄 CSV",
         data=csv_bytes,
         file_name=f"RH_TJMA_export_{slug}_{timestamp}.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
-    html_bytes = gerar_relatorio_html(df, nome_aba, origem).encode("utf-8")
-    col_pdf.download_button(
-        "🧾 Baixar relatório (abrir e Ctrl+P → PDF)",
-        data=html_bytes,
-        file_name=f"RH_TJMA_relatorio_{slug}_{timestamp}.html",
-        mime="text/html",
+    xlsx_bytes = gerar_xlsx_nativo(df, nome_aba=nome_aba)
+    col_xlsx.download_button(
+        "📊 XLSX (Excel)",
+        data=xlsx_bytes,
+        file_name=f"RH_TJMA_export_{slug}_{timestamp}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+
+    with col_pdf:
+        montar_botao_pdf_js(df, nome_aba, origem, azul_hex, chave=slug)
 
 
 def rodape():
@@ -615,7 +755,7 @@ def main():
     df_filtrado = montar_filtros(df, chave=aba_selecionada)
     montar_kpis(df_filtrado)
     montar_graficos(df_filtrado, azul, verde)
-    montar_tabela_e_export(df_filtrado, aba_selecionada, origem)
+    montar_tabela_e_export(df_filtrado, aba_selecionada, origem, azul)
     rodape()
 
 
