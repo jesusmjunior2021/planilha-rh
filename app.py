@@ -10,7 +10,7 @@ Fonte de dados (ordem de prioridade) — SEMPRE a planilha real completa,
 todas as abas, todas as colunas, estrutura original preservada:
   1) GET do workbook público completo (.xlsx, todas as abas) via export do
      Google Sheets — NÃO usa CSV de aba única, porque CSV exporta só 1 aba.
-  2) Upload manual de arquivo .xlsx/.xls completo (todas as abas).
+  2) Upload manual de arquivo .xlsx / .xls / .csv completo.
   3) Cópia local da planilha real (fallback offline), mesma estrutura.
 Regra dura: 100% dos registros e 100% das abas — sem amostragem, sem
 recorte para 1 aba só, sem invenção de linha/valor/coluna.
@@ -23,15 +23,22 @@ import openpyxl
 import streamlit as st
 import plotly.express as px
 
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+
 # ==========================================================================
 # CONFIG
 # ==========================================================================
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v1.2.0"
 APP_TITLE = "Painel RH TJMA · Auxílio-Bolsa"
 LOGIN_USER = "RH"
 LOGIN_PASS = "RH@123"
 
-GOOGLE_SHEET_ID = "1-udWUaMYkU8dhZtiHarPbDrRRTzOsDbH_HDTcwJM_c8"
+# ID atualizado (planilha nova compartilhada por link público)
+GOOGLE_SHEET_ID = "1iaXdM3maNqnvhnz7-KvGE4CL0mQDoVUjUpLjDEsipqg"
 # export?format=xlsx traz o WORKBOOK INTEIRO (todas as abas), diferente do
 # export?format=csv que só traz 1 aba (gid). É por isso que a fonte primária
 # do GET precisa ser xlsx, não csv, quando a exigência é "todas as abas".
@@ -108,7 +115,7 @@ def tela_login():
 
 
 # ==========================================================================
-# LEITURA FIEL DA PLANILHA REAL — TODAS AS ABAS, TODAS AS COLUNAS
+# LEITURA FIEL DA PLANILHA REAL — TODAS AS ABAS, TODAS AS COLUNAS (.xlsx)
 # (mesma lógica das etapas de sanitização já validadas: detecta banner
 # mesclado, cabeçalho real, última linha real; remove só o 100% vazio)
 # ==========================================================================
@@ -126,8 +133,17 @@ def _last_data_row(ws, header_row):
     return last_row
 
 
-def ler_workbook_completo(source) -> dict:
-    """Lê TODAS as abas do workbook, preservando cabeçalho/estrutura reais de
+def _dedup_headers(headers):
+    vistos = {}
+    headers_final = []
+    for h in headers:
+        vistos[h] = vistos.get(h, 0) + 1
+        headers_final.append(h if vistos[h] == 1 else f"{h} ({vistos[h]})")
+    return headers_final
+
+
+def ler_workbook_xlsx(source) -> dict:
+    """Lê TODAS as abas de um .xlsx, preservando cabeçalho/estrutura reais de
     cada aba (independentes entre si). Retorna {nome_aba: DataFrame}."""
     wb = openpyxl.load_workbook(source, data_only=True)
     abas = {}
@@ -151,16 +167,50 @@ def ler_workbook_completo(source) -> dict:
                 continue
             rows.append(vals)
 
-        # deduplicar nomes de coluna repetidos na mesma aba (mantém a ordem
-        # e o dado real; só evita erro de DataFrame com colunas duplicadas)
-        vistos = {}
-        headers_final = []
-        for h in headers:
-            vistos[h] = vistos.get(h, 0) + 1
-            headers_final.append(h if vistos[h] == 1 else f"{h} ({vistos[h]})")
-
-        abas[nome] = pd.DataFrame(rows, columns=headers_final)
+        abas[nome] = pd.DataFrame(rows, columns=_dedup_headers(headers))
     return abas
+
+
+def ler_workbook_xls(source) -> dict:
+    """Lê TODAS as abas de um .xls antigo (formato binário) via pandas/xlrd.
+    Sem a detecção fina de banner mesclado (não se aplica ao .xls antigo);
+    assume cabeçalho na primeira linha não totalmente vazia."""
+    planilhas = pd.read_excel(source, sheet_name=None, engine="xlrd", header=0)
+    abas = {}
+    for nome, df in planilhas.items():
+        df = df.dropna(how="all")
+        if df.empty:
+            continue
+        df.columns = _dedup_headers([str(c) for c in df.columns])
+        abas[nome] = df.reset_index(drop=True)
+    return abas
+
+
+def ler_csv(source) -> dict:
+    """CSV só tem 1 aba/tabela por definição. Tenta detectar separador e
+    encoding automaticamente (';' é comum em export de planilhas BR)."""
+    if hasattr(source, "seek"):
+        source.seek(0)
+    try:
+        df = pd.read_csv(source, sep=None, engine="python", encoding="utf-8-sig")
+    except Exception:
+        if hasattr(source, "seek"):
+            source.seek(0)
+        df = pd.read_csv(source, sep=";", engine="python", encoding="latin-1")
+    df = df.dropna(how="all")
+    df.columns = _dedup_headers([str(c) for c in df.columns])
+    return {"Dados (CSV)": df.reset_index(drop=True)}
+
+
+def ler_arquivo_por_extensao(source, nome_arquivo: str) -> dict:
+    ext = nome_arquivo.lower().rsplit(".", 1)[-1]
+    if ext == "xlsx":
+        return ler_workbook_xlsx(source)
+    if ext == "xls":
+        return ler_workbook_xls(source)
+    if ext == "csv":
+        return ler_csv(source)
+    raise ValueError(f"Extensão não suportada: .{ext}")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -168,7 +218,7 @@ def carregar_de_xlsx_publico(url: str):
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
-        abas = ler_workbook_completo(io.BytesIO(resp.content))
+        abas = ler_workbook_xlsx(io.BytesIO(resp.content))
         return abas if abas else None
     except Exception:
         return None
@@ -177,7 +227,7 @@ def carregar_de_xlsx_publico(url: str):
 @st.cache_data(show_spinner=False)
 def carregar_de_xlsx_local(path: str):
     try:
-        abas = ler_workbook_completo(path)
+        abas = ler_workbook_xlsx(path)
         return abas if abas else None
     except Exception:
         return None
@@ -185,7 +235,7 @@ def carregar_de_xlsx_local(path: str):
 
 def carregar_de_upload(arquivo):
     try:
-        abas = ler_workbook_completo(arquivo)
+        abas = ler_arquivo_por_extensao(arquivo, arquivo.name)
         return abas if abas else None
     except Exception as e:
         st.sidebar.error(f"Falha ao ler o arquivo enviado: {e}")
@@ -195,15 +245,15 @@ def carregar_de_upload(arquivo):
 def obter_dados():
     st.sidebar.markdown("### 📥 Fonte de dados")
     upload = st.sidebar.file_uploader(
-        "Upload manual (.xlsx / .xls completo) — alternativa ao GET público",
-        type=["xlsx", "xls"]
+        "Upload manual (.xlsx / .xls / .csv) — alternativa ao GET público",
+        type=["xlsx", "xls", "csv"]
     )
 
     if upload is not None:
         abas = carregar_de_upload(upload)
         if abas:
             st.sidebar.success(f"Carregado do upload manual · {len(abas)} aba(s)")
-            return abas, "Upload manual (.xlsx completo)"
+            return abas, f"Upload manual ({upload.name})"
 
     abas = carregar_de_xlsx_publico(XLSX_PUBLICO_URL)
     if abas:
@@ -306,15 +356,87 @@ def montar_graficos(df: pd.DataFrame, azul, verde):
         st.caption("Esta aba não possui colunas-padrão (TAG_TIPOLOGIA / TIPO DE BOLSA / COMARCA) para gráfico automático.")
 
 
-def montar_tabela_e_export(df: pd.DataFrame, nome_aba: str):
+# ==========================================================================
+# EXPORT PDF — relatório dos dados filtrados (paisagem, paginado)
+# ==========================================================================
+def gerar_pdf_relatorio(df: pd.DataFrame, nome_aba: str, origem: str) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=landscape(A4),
+        leftMargin=1.2 * cm, rightMargin=1.2 * cm, topMargin=1.2 * cm, bottomMargin=1.2 * cm,
+    )
+    estilos = getSampleStyleSheet()
+    elementos = []
+
+    elementos.append(Paragraph(f"<b>{APP_TITLE}</b>", estilos["Title"]))
+    elementos.append(Paragraph(f"Aba: {nome_aba} · Fonte: {origem}", estilos["Normal"]))
+    elementos.append(Paragraph(
+        f"Gerado em {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')} · {len(df)} registro(s) após filtro",
+        estilos["Normal"]
+    ))
+    elementos.append(Spacer(1, 0.5 * cm))
+
+    # Limita colunas exibidas no PDF para não estourar a largura da página;
+    # a tabela completa continua disponível no CSV/na tela.
+    MAX_COLS_PDF = 8
+    colunas_pdf = list(df.columns[:MAX_COLS_PDF])
+    if len(df.columns) > MAX_COLS_PDF:
+        elementos.append(Paragraph(
+            f"⚠ Exibindo as primeiras {MAX_COLS_PDF} colunas de {len(df.columns)} "
+            f"(exporte em CSV para ver a planilha completa).",
+            estilos["Normal"]
+        ))
+        elementos.append(Spacer(1, 0.3 * cm))
+
+    dados_tabela = [colunas_pdf] + df[colunas_pdf].astype(str).values.tolist()
+
+    tabela = Table(dados_tabela, repeatRows=1)
+    tabela.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1D4ED8")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6E4DC")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F8F4")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    elementos.append(tabela)
+
+    doc.build(elementos)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def montar_tabela_e_export(df: pd.DataFrame, nome_aba: str, origem: str):
     st.markdown(f"### 📋 Registros — {nome_aba}")
     st.caption(f"{len(df)} registro(s) após filtro")
     st.dataframe(df, use_container_width=True, height=420)
 
-    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     slug = nome_aba.strip().replace(" ", "_").replace("/", "-")
-    nome_arquivo = f"RH_TJMA_export_{slug}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    st.download_button("⬇️ Exportar CSV (RH TJMA)", data=csv_bytes, file_name=nome_arquivo, mime="text/csv")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+
+    col_csv, col_pdf = st.columns(2)
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    col_csv.download_button(
+        "⬇️ Exportar CSV (RH TJMA)",
+        data=csv_bytes,
+        file_name=f"RH_TJMA_export_{slug}_{timestamp}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    if col_pdf.button("🧾 Gerar relatório PDF", use_container_width=True):
+        if df.empty:
+            st.warning("Não há registros para gerar o PDF com os filtros atuais.")
+        else:
+            pdf_bytes = gerar_pdf_relatorio(df, nome_aba, origem)
+            col_pdf.download_button(
+                "⬇️ Baixar PDF gerado",
+                data=pdf_bytes,
+                file_name=f"RH_TJMA_relatorio_{slug}_{timestamp}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
 
 
 def rodape():
@@ -363,7 +485,7 @@ def main():
     df_filtrado = montar_filtros(df, chave=aba_selecionada)
     montar_kpis(df_filtrado)
     montar_graficos(df_filtrado, azul, verde)
-    montar_tabela_e_export(df_filtrado, aba_selecionada)
+    montar_tabela_e_export(df_filtrado, aba_selecionada, origem)
     rodape()
 
 
